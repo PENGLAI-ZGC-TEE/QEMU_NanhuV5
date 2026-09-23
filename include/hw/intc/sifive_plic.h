@@ -59,6 +59,15 @@ struct SiFivePLICState {
     uint32_t *claimed;
     uint32_t *enable;
 
+    /* Optional Nanhu PLIC_S_IRQ security extension state. */
+    bool secure_extension;
+    uint32_t num_sec_src_words;
+    uint32_t *sec_src;
+    uint32_t sec_ctrl;
+    uint32_t *world_state;
+    uint32_t *irq_track;
+    uint32_t sec_status;
+
     /* config */
     char *hart_config;
     uint32_t hartid_base;
@@ -77,6 +86,14 @@ struct SiFivePLICState {
 };
 
 DeviceState *sifive_plic_create(hwaddr addr, char *hart_config,
+    uint32_t num_harts,
+    uint32_t hartid_base, uint32_t num_sources,
+    uint32_t num_priorities, uint32_t priority_base,
+    uint32_t pending_base, uint32_t enable_base,
+    uint32_t enable_stride, uint32_t context_base,
+    uint32_t context_stride, uint32_t aperture_size);
+
+DeviceState *sifive_plic_create_secure(hwaddr addr, char *hart_config,
     uint32_t num_harts,
     uint32_t hartid_base, uint32_t num_sources,
     uint32_t num_priorities, uint32_t priority_base,

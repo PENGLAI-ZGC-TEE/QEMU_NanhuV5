@@ -120,7 +120,7 @@ static void xiangshan_nhv5_soc_realize(DeviceState *dev, Error **errp)
     plic_hart_config = riscv_plic_hart_config_string(hart_count);
 
     /* Per-socket PLIC */
-    s->plic = sifive_plic_create(memmap[XIANGSHAN_NHV5_PLIC].base,
+    s->plic = sifive_plic_create_secure(memmap[XIANGSHAN_NHV5_PLIC].base,
         plic_hart_config, ms->smp.cpus, 0,
         XIANGSHAN_NHV5_PLIC_NUM_SOURCES,
         XIANGSHAN_NHV5_PLIC_NUM_PRIORITIES,

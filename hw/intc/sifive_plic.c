@@ -32,6 +32,22 @@
 #include "hw/irq.h"
 #include "system/kvm.h"
 
+#define PLIC_SEC_SRC_BASE          0x4000
+#define PLIC_SEC_CTRL_OFFSET       0x4100
+#define PLIC_WORLD_STATE_BASE      0x4200
+#define PLIC_WS_ACK_BASE           0x4400
+#define PLIC_IRQ_TRACK_BASE        0x4600
+#define PLIC_SEC_STATUS_OFFSET     0x4e00
+
+#define PLIC_SEC_CTRL_ENABLE       BIT(0)
+#define PLIC_SEC_CTRL_LOCK         BIT(1)
+#define PLIC_SEC_STATUS_REJECT     BIT(0)
+
+#define PLIC_IRQ_TRACK_IN_SERVICE  BIT(0)
+#define PLIC_IRQ_TRACK_SECURE      BIT(1)
+#define PLIC_IRQ_TRACK_ID_SHIFT    2
+#define PLIC_COMPLETE_SECURE       BIT(31)
+
 static bool addr_between(uint32_t addr, uint32_t base, uint32_t num)
 {
     return addr >= base && addr - base < num;
@@ -72,6 +88,72 @@ static void sifive_plic_set_claimed(SiFivePLICState *plic, int irq, bool level)
     atomic_set_masked(&plic->claimed[irq >> 5], 1 << (irq & 31), -!!level);
 }
 
+static bool sifive_plic_irq_secure(SiFivePLICState *plic, uint32_t irq)
+{
+    uint32_t bit;
+
+    if (!irq || irq >= plic->num_sources) {
+        return false;
+    }
+
+    bit = irq - 1;
+    return !!(plic->sec_src[bit >> 5] & BIT(bit & 31));
+}
+
+static bool sifive_plic_hart_secure_busy(SiFivePLICState *plic,
+                                         uint32_t hartid)
+{
+    int addrid;
+
+    for (addrid = 0; addrid < plic->num_addrs; addrid++) {
+        uint32_t track = plic->irq_track[addrid];
+
+        if (plic->addr_config[addrid].hartid == hartid &&
+            (track & PLIC_IRQ_TRACK_IN_SERVICE) &&
+            (track & PLIC_IRQ_TRACK_SECURE)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool sifive_plic_irq_routed(SiFivePLICState *plic, uint32_t addrid,
+                                   uint32_t irq)
+{
+    PLICAddr *target = &plic->addr_config[addrid];
+    uint32_t hart = target->hartid - plic->hartid_base;
+    bool secure = sifive_plic_irq_secure(plic, irq);
+    bool to_s;
+
+    if (!plic->secure_extension ||
+        !(plic->sec_ctrl & PLIC_SEC_CTRL_ENABLE)) {
+        return true;
+    }
+
+    to_s = secure == !!plic->world_state[hart];
+    if (target->mode == PLICMode_S) {
+        return to_s;
+    }
+    if (target->mode == PLICMode_M) {
+        return !to_s &&
+               !(sifive_plic_hart_secure_busy(plic, target->hartid) &&
+                 !secure);
+    }
+
+    return false;
+}
+
+static bool sifive_plic_irq_enabled(SiFivePLICState *plic, uint32_t addrid,
+                                    uint32_t irq)
+{
+    uint32_t word = irq >> 5;
+
+    return irq && irq < plic->num_sources &&
+           !!(plic->enable[addrid * plic->bitfield_words + word] &
+              BIT(irq & 31));
+}
+
 static uint32_t sifive_plic_claimed(SiFivePLICState *plic, uint32_t addrid)
 {
     uint32_t max_irq = 0;
@@ -102,7 +184,8 @@ static uint32_t sifive_plic_claimed(SiFivePLICState *plic, uint32_t addrid)
             uint32_t prio = plic->source_priority[irq];
             int enabled = pending_enabled_not_claimed & (1 << j);
 
-            if (enabled && prio > max_prio) {
+            if (enabled && sifive_plic_irq_routed(plic, addrid, irq) &&
+                prio > max_prio) {
                 max_irq = irq;
                 max_prio = prio;
             }
@@ -139,6 +222,32 @@ static uint64_t sifive_plic_read(void *opaque, hwaddr addr, unsigned size)
 {
     SiFivePLICState *plic = opaque;
 
+    if (plic->secure_extension) {
+        if (addr_between(addr, PLIC_SEC_SRC_BASE,
+                         plic->num_sec_src_words * sizeof(uint32_t))) {
+            return plic->sec_src[(addr - PLIC_SEC_SRC_BASE) >> 2];
+        } else if (addr == PLIC_SEC_CTRL_OFFSET) {
+            return plic->sec_ctrl;
+        } else if (addr_between(addr, PLIC_WORLD_STATE_BASE,
+                                plic->num_harts * 8) &&
+                   !((addr - PLIC_WORLD_STATE_BASE) & 7)) {
+            return plic->world_state[(addr - PLIC_WORLD_STATE_BASE) >> 3];
+        } else if (addr_between(addr, PLIC_WS_ACK_BASE,
+                                plic->num_harts * 8) &&
+                   !((addr - PLIC_WS_ACK_BASE) & 7)) {
+            uint32_t hart = (addr - PLIC_WS_ACK_BASE) >> 3;
+
+            /* QEMU commits MMIO writes atomically, so the echo is stable. */
+            return BIT(7) | plic->world_state[hart];
+        } else if (addr_between(addr, PLIC_IRQ_TRACK_BASE,
+                                plic->num_addrs * 8) &&
+                   !((addr - PLIC_IRQ_TRACK_BASE) & 7)) {
+            return plic->irq_track[(addr - PLIC_IRQ_TRACK_BASE) >> 3];
+        } else if (addr == PLIC_SEC_STATUS_OFFSET) {
+            return plic->sec_status;
+        }
+    }
+
     if (addr_between(addr, plic->priority_base, plic->num_sources << 2)) {
         uint32_t irq = (addr - plic->priority_base) >> 2;
 
@@ -169,6 +278,13 @@ static uint64_t sifive_plic_read(void *opaque, hwaddr addr, unsigned size)
             if (max_irq) {
                 sifive_plic_set_pending(plic, max_irq, false);
                 sifive_plic_set_claimed(plic, max_irq, true);
+                if (plic->secure_extension) {
+                    plic->irq_track[addrid] =
+                        max_irq << PLIC_IRQ_TRACK_ID_SHIFT |
+                        (sifive_plic_irq_secure(plic, max_irq) ?
+                         PLIC_IRQ_TRACK_SECURE : 0) |
+                        PLIC_IRQ_TRACK_IN_SERVICE;
+                }
             }
 
             sifive_plic_update(plic);
@@ -186,6 +302,38 @@ static void sifive_plic_write(void *opaque, hwaddr addr, uint64_t value,
         unsigned size)
 {
     SiFivePLICState *plic = opaque;
+
+    if (plic->secure_extension) {
+        if (addr_between(addr, PLIC_SEC_SRC_BASE,
+                         plic->num_sec_src_words * sizeof(uint32_t))) {
+            if (!(plic->sec_ctrl & PLIC_SEC_CTRL_LOCK)) {
+                plic->sec_src[(addr - PLIC_SEC_SRC_BASE) >> 2] = value;
+                sifive_plic_update(plic);
+            }
+            return;
+        } else if (addr == PLIC_SEC_CTRL_OFFSET) {
+            uint32_t old = plic->sec_ctrl;
+            uint32_t enable = old & PLIC_SEC_CTRL_ENABLE;
+
+            if (!(old & PLIC_SEC_CTRL_LOCK)) {
+                enable = value & PLIC_SEC_CTRL_ENABLE;
+            }
+            plic->sec_ctrl = enable |
+                ((old | value) & PLIC_SEC_CTRL_LOCK);
+            sifive_plic_update(plic);
+            return;
+        } else if (addr_between(addr, PLIC_WORLD_STATE_BASE,
+                                plic->num_harts * 8) &&
+                   !((addr - PLIC_WORLD_STATE_BASE) & 7)) {
+            plic->world_state[(addr - PLIC_WORLD_STATE_BASE) >> 3] =
+                value & 1;
+            sifive_plic_update(plic);
+            return;
+        } else if (addr == PLIC_SEC_STATUS_OFFSET) {
+            plic->sec_status &= ~(value & 0xf);
+            return;
+        }
+    }
 
     if (addr_between(addr, plic->priority_base, plic->num_sources << 2)) {
         uint32_t irq = (addr - plic->priority_base) >> 2;
@@ -244,8 +392,35 @@ static void sifive_plic_write(void *opaque, hwaddr addr, uint64_t value,
                 sifive_plic_update(plic);
             }
         } else if (contextid == 4) {
-            if (value < plic->num_sources) {
-                sifive_plic_set_claimed(plic, value, false);
+            uint32_t irq = value;
+            bool accept;
+
+            if (plic->secure_extension) {
+                uint32_t track = plic->irq_track[addrid];
+                uint32_t id_mask = pow2ceil(plic->num_sources) - 1;
+                bool req_secure = !!(value & PLIC_COMPLETE_SECURE);
+
+                irq &= id_mask;
+                accept = irq < plic->num_sources &&
+                         sifive_plic_irq_enabled(plic, addrid, irq) &&
+                         (!(plic->sec_ctrl & PLIC_SEC_CTRL_ENABLE) ||
+                          ((track & PLIC_IRQ_TRACK_IN_SERVICE) &&
+                           ((track >> PLIC_IRQ_TRACK_ID_SHIFT) & 0x3fff) ==
+                           irq &&
+                           (!!(track & PLIC_IRQ_TRACK_SECURE) ==
+                            req_secure)));
+                if (accept) {
+                    plic->irq_track[addrid] &=
+                        ~PLIC_IRQ_TRACK_IN_SERVICE;
+                } else if (plic->sec_ctrl & PLIC_SEC_CTRL_ENABLE) {
+                    plic->sec_status |= PLIC_SEC_STATUS_REJECT;
+                }
+            } else {
+                accept = irq < plic->num_sources;
+            }
+
+            if (accept) {
+                sifive_plic_set_claimed(plic, irq, false);
                 sifive_plic_update(plic);
             }
         } else {
@@ -280,6 +455,16 @@ static void sifive_plic_reset(DeviceState *dev)
     memset(s->pending, 0, sizeof(uint32_t) * s->bitfield_words);
     memset(s->claimed, 0, sizeof(uint32_t) * s->bitfield_words);
     memset(s->enable, 0, sizeof(uint32_t) * s->num_enables);
+    if (s->secure_extension) {
+        memset(s->sec_src, 0,
+               sizeof(uint32_t) * s->num_sec_src_words);
+        s->sec_ctrl = 0;
+        for (i = 0; i < s->num_harts; i++) {
+            s->world_state[i] = 1;
+        }
+        memset(s->irq_track, 0, sizeof(uint32_t) * s->num_addrs);
+        s->sec_status = 0;
+    }
 
     for (i = 0; i < s->num_harts; i++) {
         qemu_set_irq(s->m_external_irqs[i], 0);
@@ -383,6 +568,24 @@ static void sifive_plic_realize(DeviceState *dev, Error **errp)
     s->pending = g_new0(uint32_t, s->bitfield_words);
     s->claimed = g_new0(uint32_t, s->bitfield_words);
     s->enable = g_new0(uint32_t, s->num_enables);
+    if (s->secure_extension) {
+        s->num_sec_src_words = ((s->num_sources - 1) + 31) >> 5;
+
+        if (s->enable_base + s->num_addrs * s->enable_stride >
+                PLIC_SEC_SRC_BASE ||
+            PLIC_SEC_SRC_BASE + s->num_sec_src_words * sizeof(uint32_t) >
+                PLIC_SEC_CTRL_OFFSET ||
+            PLIC_WORLD_STATE_BASE + s->num_harts * 8 > PLIC_WS_ACK_BASE ||
+            PLIC_IRQ_TRACK_BASE + s->num_addrs * 8 >
+                PLIC_SEC_STATUS_OFFSET) {
+            error_setg(errp, "plic: security extension register map overlap");
+            return;
+        }
+
+        s->sec_src = g_new0(uint32_t, s->num_sec_src_words);
+        s->world_state = g_new0(uint32_t, s->num_harts);
+        s->irq_track = g_new0(uint32_t, s->num_addrs);
+    }
 
     qdev_init_gpio_in(dev, sifive_plic_irq_request, s->num_sources);
 
@@ -409,6 +612,34 @@ static void sifive_plic_realize(DeviceState *dev, Error **errp)
     msi_nonbroken = true;
 }
 
+static bool vmstate_sifive_plic_secure_needed(void *opaque)
+{
+    SiFivePLICState *s = opaque;
+
+    return s->secure_extension;
+}
+
+static const VMStateDescription vmstate_sifive_plic_secure = {
+    .name = "riscv_sifive_plic/secure",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vmstate_sifive_plic_secure_needed,
+    .fields = (const VMStateField[]) {
+            VMSTATE_VARRAY_UINT32(sec_src, SiFivePLICState,
+                                  num_sec_src_words, 0,
+                                  vmstate_info_uint32, uint32_t),
+            VMSTATE_UINT32(sec_ctrl, SiFivePLICState),
+            VMSTATE_VARRAY_UINT32(world_state, SiFivePLICState,
+                                  num_harts, 0,
+                                  vmstate_info_uint32, uint32_t),
+            VMSTATE_VARRAY_UINT32(irq_track, SiFivePLICState,
+                                  num_addrs, 0,
+                                  vmstate_info_uint32, uint32_t),
+            VMSTATE_UINT32(sec_status, SiFivePLICState),
+            VMSTATE_END_OF_LIST()
+        }
+};
+
 static const VMStateDescription vmstate_sifive_plic = {
     .name = "riscv_sifive_plic",
     .version_id = 1,
@@ -427,7 +658,11 @@ static const VMStateDescription vmstate_sifive_plic = {
             VMSTATE_VARRAY_UINT32(enable, SiFivePLICState, num_enables, 0,
                                   vmstate_info_uint32, uint32_t),
             VMSTATE_END_OF_LIST()
-        }
+        },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_sifive_plic_secure,
+        NULL
+    }
 };
 
 static const Property sifive_plic_properties[] = {
@@ -444,6 +679,8 @@ static const Property sifive_plic_properties[] = {
     DEFINE_PROP_UINT32("context-base", SiFivePLICState, context_base, 0),
     DEFINE_PROP_UINT32("context-stride", SiFivePLICState, context_stride, 0),
     DEFINE_PROP_UINT32("aperture-size", SiFivePLICState, aperture_size, 0),
+    DEFINE_PROP_BOOL("secure-extension", SiFivePLICState,
+                     secure_extension, false),
 };
 
 static void sifive_plic_class_init(ObjectClass *klass, const void *data)
@@ -473,13 +710,14 @@ type_init(sifive_plic_register_types)
 /*
  * Create PLIC device.
  */
-DeviceState *sifive_plic_create(hwaddr addr, char *hart_config,
+static DeviceState *sifive_plic_create_internal(hwaddr addr,
+    char *hart_config,
     uint32_t num_harts,
     uint32_t hartid_base, uint32_t num_sources,
     uint32_t num_priorities, uint32_t priority_base,
     uint32_t pending_base, uint32_t enable_base,
     uint32_t enable_stride, uint32_t context_base,
-    uint32_t context_stride, uint32_t aperture_size)
+    uint32_t context_stride, uint32_t aperture_size, bool secure_extension)
 {
     DeviceState *dev = qdev_new(TYPE_SIFIVE_PLIC);
     int i;
@@ -498,6 +736,7 @@ DeviceState *sifive_plic_create(hwaddr addr, char *hart_config,
     qdev_prop_set_uint32(dev, "context-base", context_base);
     qdev_prop_set_uint32(dev, "context-stride", context_stride);
     qdev_prop_set_uint32(dev, "aperture-size", aperture_size);
+    qdev_prop_set_bit(dev, "secure-extension", secure_extension);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, addr);
 
@@ -518,4 +757,32 @@ DeviceState *sifive_plic_create(hwaddr addr, char *hart_config,
     }
 
     return dev;
+}
+
+DeviceState *sifive_plic_create(hwaddr addr, char *hart_config,
+    uint32_t num_harts,
+    uint32_t hartid_base, uint32_t num_sources,
+    uint32_t num_priorities, uint32_t priority_base,
+    uint32_t pending_base, uint32_t enable_base,
+    uint32_t enable_stride, uint32_t context_base,
+    uint32_t context_stride, uint32_t aperture_size)
+{
+    return sifive_plic_create_internal(addr, hart_config, num_harts,
+        hartid_base, num_sources, num_priorities, priority_base,
+        pending_base, enable_base, enable_stride, context_base,
+        context_stride, aperture_size, false);
+}
+
+DeviceState *sifive_plic_create_secure(hwaddr addr, char *hart_config,
+    uint32_t num_harts,
+    uint32_t hartid_base, uint32_t num_sources,
+    uint32_t num_priorities, uint32_t priority_base,
+    uint32_t pending_base, uint32_t enable_base,
+    uint32_t enable_stride, uint32_t context_base,
+    uint32_t context_stride, uint32_t aperture_size)
+{
+    return sifive_plic_create_internal(addr, hart_config, num_harts,
+        hartid_base, num_sources, num_priorities, priority_base,
+        pending_base, enable_base, enable_stride, context_base,
+        context_stride, aperture_size, true);
 }
