@@ -96,7 +96,8 @@ static bool sifive_plic_irq_secure(SiFivePLICState *plic, uint32_t irq)
         return false;
     }
 
-    bit = irq - 1;
+    /* SEC_SRC uses the same ID-indexed bitmap as pending and enable. */
+    bit = irq;
     return !!(plic->sec_src[bit >> 5] & BIT(bit & 31));
 }
 
@@ -307,7 +308,14 @@ static void sifive_plic_write(void *opaque, hwaddr addr, uint64_t value,
         if (addr_between(addr, PLIC_SEC_SRC_BASE,
                          plic->num_sec_src_words * sizeof(uint32_t))) {
             if (!(plic->sec_ctrl & PLIC_SEC_CTRL_LOCK)) {
-                plic->sec_src[(addr - PLIC_SEC_SRC_BASE) >> 2] = value;
+                uint32_t word = (addr - PLIC_SEC_SRC_BASE) >> 2;
+                uint32_t valid_bits = MIN(32, plic->num_sources - word * 32);
+                uint32_t mask = UINT32_MAX >> (32 - valid_bits);
+
+                if (!word) {
+                    mask &= ~1U; /* Source ID 0 is reserved. */
+                }
+                plic->sec_src[word] = value & mask;
                 sifive_plic_update(plic);
             }
             return;
@@ -569,7 +577,7 @@ static void sifive_plic_realize(DeviceState *dev, Error **errp)
     s->claimed = g_new0(uint32_t, s->bitfield_words);
     s->enable = g_new0(uint32_t, s->num_enables);
     if (s->secure_extension) {
-        s->num_sec_src_words = ((s->num_sources - 1) + 31) >> 5;
+        s->num_sec_src_words = s->bitfield_words;
 
         if (s->enable_base + s->num_addrs * s->enable_stride >
                 PLIC_SEC_SRC_BASE ||
@@ -621,8 +629,9 @@ static bool vmstate_sifive_plic_secure_needed(void *opaque)
 
 static const VMStateDescription vmstate_sifive_plic_secure = {
     .name = "riscv_sifive_plic/secure",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    /* Version 1 used source ID - 1 for the SEC_SRC bitmap. */
+    .version_id = 2,
+    .minimum_version_id = 2,
     .needed = vmstate_sifive_plic_secure_needed,
     .fields = (const VMStateField[]) {
             VMSTATE_VARRAY_UINT32(sec_src, SiFivePLICState,
